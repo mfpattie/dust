@@ -174,7 +174,7 @@ export async function readFrontTableChunk({
   const workspace = await getWorkspaceInfos(workspaceId);
   assert(workspace, "Workspace not found");
 
-  const idClause = lastId ? `AND id > ${lastId}` : "";
+  const idClause = lastId ? `AND id > :lastId` : "";
 
   const rows = await frontSequelize.query<{ id: ModelId }>(
     `SELECT * FROM "${tableName}"
@@ -182,7 +182,7 @@ export async function readFrontTableChunk({
      ORDER BY id
      LIMIT :limit`,
     {
-      replacements: { workspaceId: workspace.id, limit: realLimit },
+      replacements: { workspaceId: workspace.id, limit: realLimit, ...(lastId ? { lastId } : {}) },
       type: QueryTypes.SELECT,
       raw: true,
     }
