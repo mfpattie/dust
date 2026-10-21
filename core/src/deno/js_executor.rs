@@ -1,9 +1,14 @@
-use std::{ops::Add, sync::mpsc, time::Duration};
+use std::{ops::Add, sync::mpsc, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
 use deno_core::{error::AnyError, serde_v8, v8, JsRuntime, RuntimeOptions};
 use parking_lot::RwLock;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
+
+// Maximum number of concurrent JavaScript executions to prevent thread exhaustion.
+// This limit protects against authenticated users submitting workflows with non-yielding
+// loops that would otherwise accumulate permanently blocked threads.
+const MAX_CONCURRENT_JS_EXECUTIONS: usize = 64;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct ValueWithLogs {
@@ -69,6 +74,7 @@ static JS_CLIENT: RwLock<Option<JSClient>> = RwLock::new(None);
 
 pub struct JSExecutor {
     rx: mpsc::Receiver<JSRequest>,
+    semaphore: Arc<Semaphore>,
 }
 
 /// JSExecutor is in charge of spawning a dedicated thread per deno runtime to execute isolated and
@@ -156,7 +162,8 @@ impl JSExecutor {
     // client can be cloned and used in any thread or tokio worker.
     pub fn new() -> (Self, JSClient) {
         let (tx, rx) = mpsc::channel();
-        (JSExecutor { rx }, JSClient { tx })
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_JS_EXECUTIONS));
+        (JSExecutor { rx, semaphore }, JSClient { tx })
     }
 
     pub fn start(mut executor: JSExecutor) -> std::thread::JoinHandle<()> {
@@ -240,6 +247,8 @@ impl JSExecutor {
                 Err(_) => break,
             };
 
+            let semaphore = self.semaphore.clone();
+
             // We don't join or store handles since these executions are blocking runs which are
             // awaited on the tokio runtime.
             std::thread::spawn(move || {
@@ -249,6 +258,21 @@ impl JSExecutor {
                     .unwrap();
 
                 let v = rt.block_on(async {
+                    // Acquire a permit from the semaphore to limit concurrent executions.
+                    // This prevents thread exhaustion from repeated workflow submissions
+                    // containing non-yielding JavaScript loops.
+                    let _permit = match semaphore.try_acquire() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            // If we cannot acquire a permit, return an error immediately
+                            // rather than spawning a thread that would block indefinitely.
+                            return Err(anyhow!(
+                                "JavaScript execution capacity exceeded. Maximum concurrent executions: {}",
+                                MAX_CONCURRENT_JS_EXECUTIONS
+                            ));
+                        }
+                    };
+
                     tokio::time::timeout(
                         // This is mostly defense in depth as the exec function will also attempt
                         // to terminate the execution after the timeout. We therefore add a buffer.
